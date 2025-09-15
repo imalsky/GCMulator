@@ -1,0 +1,64 @@
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+._*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+.python-version
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+ENV/
+*.env
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Jupyter / tooling caches ---
+.ipynb_checkpoints/
+.cache/
+.mypy_cache/
+.pytest_cache/
+ruff_cache/
+.coverage*
+coverage.xml
+htmlcov/
+
+# --- Project data & artifacts ---
+# Raw and processed datasets (huge / derived)
+data/raw/
+data/processed/
+
+# Training outputs (checkpoints, copied configs, logs)
+models/
+
+# Logs & figures
+logs/
+figures/
+
+# Keep placeholders/docs if you add them
+!.gitkeep
+!data/README.md
+!models/README.md
+
+# --- Common model artifacts anywhere ---
+*.pt
+*.pth
+*.ckpt
+
+# --- Normalization stats (derived) ---
+stats.pt
