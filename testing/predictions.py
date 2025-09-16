@@ -33,9 +33,9 @@ import matplotlib.pyplot as plt
 # ============ GLOBALS ============
 MODEL_NAME          = "trained_model"      # subdir under models/
 CKPT_FILENAME       = "model_best.pt"      # or "model_last.pt"
-FILE_INDEX          = 1                    # raw pair: [i, i+1]
+FILE_INDEX          = 50                    # raw pair: [i, i+1]
 FEATURE_NAME        = "temp"               # variable name (e.g., "temp")
-LEVEL_INDEX         = 30                    # vertical level index within that variable
+LEVEL_INDEX         = 39                    # vertical level index within that variable
 
 # Colormaps / figure
 CMAP_MAPS           = "twilight_shifted"   # for TRUE and PRED
