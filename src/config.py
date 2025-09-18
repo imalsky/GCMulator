@@ -80,7 +80,7 @@ SCALE_FACTOR: int = 1
 # Channels are inferred from data; embed/stack depth
 EMBED_DIM: int = 16
 NUM_LAYERS: int = 4
-ENCODER_LAYERS: int = 1
+ENCODER_LAYERS: int = 3
 
 # MLP head inside each block
 USE_MLP: bool = False
@@ -105,9 +105,9 @@ RESIDUAL_PREDICTION: Optional[bool] = None
 # =========================
 # Training
 # =========================
-BATCH_SIZE: int = 4
-EPOCHS: int = 100
-WEIGHT_DECAY: float = 0.0
+BATCH_SIZE: int = 64
+EPOCHS: int = 200
+WEIGHT_DECAY: float = 1e-5
 
 # LR scheduler (cosine annealing)
 LR_SCHEDULER: Optional[str] = "cosine"  # "cosine" or None

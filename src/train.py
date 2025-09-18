@@ -1,315 +1,307 @@
 #!/usr/bin/env python3
 """
-Training utilities with spherical losses and clean logging/checkpointing.
-
-This module implements the two loss functions you referenced:
-
-- l2loss_sphere(solver, prd, tar, relative=False, squared=True)
-- spectral_l2loss_sphere(solver, prd, tar, relative=False, squared=True)
-
-…where `solver` provides:
-  - integrate_grid(x): area-weighted integral over the sphere (cos(lat) weights)
-  - sht(x): spherical harmonic transform (optional; raises if not wired)
-
-It also provides `train_loop(...)` which:
-  - prints aligned epoch metrics (LR, train/val loss in scientific notation with 4 decimals)
-  - tracks & saves best/last checkpoints into `run_dir`
-  - writes a compact CSV of metrics in `run_dir / metrics.csv`
-  - uses the modern AMP API (`torch.amp.autocast`, `torch.amp.GradScaler`)
-
-If you want spectral loss, implement `SphereOps.sht` in `sphere_ops.py` (currently NotImplemented).
+Training loop with spherical losses and mixed precision support.
 """
-from __future__ import annotations
 
-import csv
+from __future__ import annotations
+import csv  # kept for parity; callers may write CSV logs
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Callable
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from sphere_ops import SphereOps
-from config import LOG_EVERY_N_STEPS, EPOCHS
+from config import LOG_EVERY_N_STEPS, EPOCHS  # EPOCHS kept for parity
 
 
-# ----------------------- Losses (from your example) -----------------------
+# ------------------- dtype helpers -------------------
+_DTYPE_ALIASES = {
+    "fp32": torch.float32, "float32": torch.float32, "f32": torch.float32,
+    "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,  "float16": torch.float16, "f16": torch.float16,
+}
+def _coerce_dtype(x: Union[str, torch.dtype, None]) -> torch.dtype:
+    if isinstance(x, torch.dtype):
+        return x
+    if isinstance(x, str):
+        k = x.strip().lower()
+        if k in _DTYPE_ALIASES:
+            return _DTYPE_ALIASES[k]
+        raise ValueError(f"Unknown dtype string: {x!r}")
+    return torch.float32
 
-def l2loss_sphere(solver: SphereOps, prd: torch.Tensor, tar: torch.Tensor,
-                  relative: bool = False, squared: bool = True) -> torch.Tensor:
+def _maybe_cast(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return t if t.dtype is dtype else t.to(dtype=dtype)
+
+
+# ------------------- losses -------------------
+def l2loss_sphere(
+    solver: SphereOps,
+    prd: torch.Tensor,
+    tar: torch.Tensor,
+    relative: bool = False,
+    squared: bool = True,
+) -> torch.Tensor:
     """
-    Area-weighted L2 on the sphere using cos(lat) integration.
+    Area-weighted L2 loss on the sphere using solver.integrate_grid.
+    Expects [N, C, H, W]. Reductions accumulate in float32 for stability.
 
-    Expected shapes:
-      prd, tar: [B,C,H,W] or [C,H,W]
-    Returns a scalar tensor.
+    - If relative=False: ∫ (prd - tar)^2 dA   (absolute)
+    - If relative=True : ∫ (prd - tar)^2 dA / ∫ tar^2 dA   (relative)
+    Channel reduction: sum over channels before batch mean (matches reference).
     """
-    diff = prd - tar
-    # integrate -> [B,C] (or [C]) then sum over channels -> [B] (or [])
-    loss = solver.integrate_grid(diff ** 2, dimensionless=True)
-    loss = loss.sum(dim=-1) if loss.dim() >= 2 else loss
+    prd_fp32 = prd.to(dtype=torch.float32)
+    tar_fp32 = tar.to(dtype=torch.float32)
+
+    diff2 = (prd_fp32 - tar_fp32) ** 2
+    # Integrate over (H, W); typical return shape: [N, C]
+    num = solver.integrate_grid(diff2, dimensionless=True).sum(dim=-1)
 
     if relative:
-        denom = solver.integrate_grid(tar ** 2, dimensionless=True)
-        denom = denom.sum(dim=-1) if denom.dim() >= 2 else denom
-        loss = loss / torch.clamp(denom, min=1e-30)
+        den = solver.integrate_grid(tar_fp32 ** 2, dimensionless=True).sum(dim=-1)
+        num = num / torch.clamp(den, min=1e-30)
 
+    out = num
     if not squared:
-        loss = torch.sqrt(torch.clamp(loss, min=0.0))
-    # average over batch if present
-    return loss.mean()
+        out = torch.sqrt(torch.clamp(out, min=0.0))
+
+    # Final batch reduction
+    return out.mean()
 
 
-def spectral_l2loss_sphere(solver: SphereOps, prd: torch.Tensor, tar: torch.Tensor,
-                           relative: bool = False, squared: bool = True) -> torch.Tensor:
+def spectral_l2loss_sphere(
+    solver: SphereOps,
+    prd: torch.Tensor,
+    tar: torch.Tensor,
+    relative: bool = False,
+    squared: bool = True,
+) -> torch.Tensor:
     """
-    Spectral L2 loss in spherical harmonic space, matching your reference.
-
-    NOTE: Requires `solver.sht` to be implemented. If not, this will raise.
+    Spectral L2 loss in spherical-harmonic space (requires SphereOps.sht()).
     """
+    prd_fp32 = prd.to(dtype=torch.float32)
+    tar_fp32 = tar.to(dtype=torch.float32)
+
     try:
-        coeffs = torch.view_as_real(solver.sht(prd - tar))
-    except NotImplementedError as e:
-        raise NotImplementedError(
-            "SphereOps.sht is not implemented. To use spectral_l2loss_sphere, "
-            "wire torch-harmonics' SHT in sphere_ops.py (or switch loss_kind='l2')."
-        ) from e
+        coeffs = torch.view_as_real(solver.sht(prd_fp32 - tar_fp32))  # [..., l, m, 2]
+    except NotImplementedError:
+        raise NotImplementedError("Spectral loss requires SphereOps.sht implementation")
 
-    # coeff power: |a_lm|^2 = Re^2 + Im^2
-    coeffs = coeffs[..., 0] ** 2 + coeffs[..., 1] ** 2
-    # norm2 over m: m=0 term + 2*sum_{m>=1}
-    norm2 = coeffs[..., :, 0] + 2 * torch.sum(coeffs[..., :, 1:], dim=-1)
-    # sum over (B?, C?) and l
-    loss = torch.sum(norm2, dim=(-1, -2))
+    # |a_lm|^2 = Re^2 + Im^2; fold m>0 by factor 2
+    coeffs = coeffs[..., 0] ** 2 + coeffs[..., 1] ** 2       # [..., l, m]
+    norm2 = coeffs[..., :, 0] + 2 * torch.sum(coeffs[..., :, 1:], dim=-1)  # [..., l]
+    num = torch.sum(norm2, dim=(-1, -2))  # sum over l (and channels if present)
 
     if relative:
-        tar_coeffs = torch.view_as_real(solver.sht(tar))
+        tar_coeffs = torch.view_as_real(solver.sht(tar_fp32))
         tar_coeffs = tar_coeffs[..., 0] ** 2 + tar_coeffs[..., 1] ** 2
         tar_norm2 = tar_coeffs[..., :, 0] + 2 * torch.sum(tar_coeffs[..., :, 1:], dim=-1)
-        tar_norm2 = torch.sum(tar_norm2, dim=(-1, -2))
-        loss = loss / torch.clamp(tar_norm2, min=1e-30)
+        den = torch.sum(tar_norm2, dim=(-1, -2))
+        num = num / torch.clamp(den, min=1e-30)
 
+    out = num
     if not squared:
-        loss = torch.sqrt(torch.clamp(loss, min=0.0))
-    return loss.mean()
+        out = torch.sqrt(torch.clamp(out, min=0.0))
+
+    return out.mean()
 
 
-# ----------------------- Helpers -----------------------
-
-def _format_sci4(x: float) -> str:
-    return f"{x:.4e}"
-
-
-def _current_lr(optim: torch.optim.Optimizer) -> float:
-    return float(optim.param_groups[0].get("lr", 0.0))
-
-
-def _unwrap_base_dataset(ds):
+# ------------------- criterion builders -------------------
+def make_spherical_mse(
+    nlat: int,
+    nlon: int,
+    *,
+    relative: bool = False,
+    squared: bool = True,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """
-    Unwrap torch.utils.data.Subset chains to reach the underlying dataset.
+    Build area-weighted MSE over an equiangular grid:
+      lat ∈ [-90, 90] (inclusive), nlat points
+      lon ∈ [0, 360) (uniform steps), nlon points
     """
-    seen = set()
-    cur = ds
-    # Avoid infinite loop if something strange exposes .dataset self-cycles
-    for _ in range(10):
-        if hasattr(cur, "dataset") and cur not in seen:
-            seen.add(cur)
-            cur = cur.dataset
-        else:
-            break
-    return cur
+    lat = np.linspace(-90.0, 90.0, nlat, dtype=np.float64)
+    lon = np.linspace(0.0, 360.0, nlon, endpoint=False, dtype=np.float64)
+    solver = SphereOps(lat=lat, lon=lon)
+
+    def criterion(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return l2loss_sphere(solver, pred, target, relative=relative, squared=squared)
+    return criterion
 
 
-def _maybe_build_sphere_ops(train_loader: DataLoader) -> Optional[SphereOps]:
-    """
-    Attempt to construct SphereOps(lat, lon) from the underlying dataset.
-    Returns None if not possible.
-    """
-    try:
-        base = _unwrap_base_dataset(train_loader.dataset)
-        lat = getattr(base, "lat", None)
-        lon = getattr(base, "lon", None)
-        if lat is None or lon is None:
-            return None
-        return SphereOps(lat=lat, lon=lon)
-    except Exception:
-        return None
+def make_spectral_mse(
+    nlat: int,
+    nlon: int,
+    *,
+    relative: bool = False,
+    squared: bool = True,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Spectral MSE criterion (requires SphereOps.sht())."""
+    lat = np.linspace(-90.0, 90.0, nlat, dtype=np.float64)
+    lon = np.linspace(0.0, 360.0, nlon, endpoint=False, dtype=np.float64)
+    solver = SphereOps(lat=lat, lon=lon)
+
+    def criterion(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return spectral_l2loss_sphere(solver, pred, target, relative=relative, squared=squared)
+    return criterion
 
 
-# ----------------------- Training Loop -----------------------
-
+# ------------------- training loop -------------------
 def train_loop(
+    *,
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    val_criterion: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     train_loader: DataLoader,
     val_loader: Optional[DataLoader],
-    optimizer: torch.optim.Optimizer,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    scheduler: Optional[object],
     device: torch.device,
     run_dir: Path,
     logger,
-    epochs: int = EPOCHS,
-    use_amp: bool = False,
-    loss_kind: str = "l2",   # 'l2' or 'spectral_l2'
-    nfuture: int = 0,        # optional autoregressive unrolls
+    epochs: int,
+    use_amp: bool,
+    dtype: Union[str, torch.dtype] = torch.float32,
 ) -> Tuple[float, Path, Path]:
     """
-    Trains and checkpoints the model.
+    Full training loop with dtype coercion and AMP handling.
 
-    Returns: (best_val, best_ckpt_path, last_ckpt_path)
+    Returns:
+        best_val: float
+        best_ckpt: Path
+        last_ckpt: Path
     """
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    dtype = _coerce_dtype(dtype)
+
+    # IMPORTANT: do NOT cast model dtype; SFNO may contain complex params/buffers.
+    model = model.to(device=device)
+
+    device_type = "cuda" if getattr(device, "type", None) == "cuda" else "cpu"
+
+    # AMP config: autocast to requested dtype; GradScaler only for CUDA FP16
+    if use_amp and dtype in (torch.float16, torch.bfloat16):
+        autocast_dtype = dtype
+        scaler = torch.cuda.amp.GradScaler(enabled=(device_type == "cuda" and dtype is torch.float16))
+        amp_enabled = True
+    else:
+        autocast_dtype = torch.float32
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        amp_enabled = False
+
+    logger.info(
+        f"Train precision: autocast={autocast_dtype}, "
+        f"grad_scaler={'on' if scaler.is_enabled() else 'off'}"
+    )
+
     run_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = run_dir / "metrics.csv"
-    best_ckpt = run_dir / "model_best.pt"
-    last_ckpt = run_dir / "model_last.pt"
-
-    # Modern AMP API (fixes the deprecation warnings you saw)
-    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda"))
-    autocast_enabled = (use_amp and device.type == "cuda")
-
-    # Construct SphereOps for spherical losses if possible
-    solver = _maybe_build_sphere_ops(train_loader)
-    if solver is None and loss_kind.startswith("spectral"):
-        raise RuntimeError(
-            "Requested spectral loss but could not construct SphereOps from dataset "
-            "(lat/lon not found). Use loss_kind='l2' or expose 'lat'/'lon' on the dataset."
-        )
-
-    # CSV header
-    with csv_path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "train_loss", "val_loss", "epoch_time_s", "lr", "loss_kind", "nfuture"])
-
-    # Pretty header (aligned)
-    header = "Epoch |    LR       |   Train Loss    |     Val Loss     |  Time/ep (s)"
-    logger.info(header)
-    logger.info("-" * len(header))
+    best_ckpt = run_dir / "ckpt_best.pt"
+    last_ckpt = run_dir / "ckpt_last.pt"
 
     best_val = float("inf")
     best_epoch = -1
 
+    # ------------------------------------------------------------------
+    # Epoch loop
+    # ------------------------------------------------------------------
     for epoch in range(1, epochs + 1):
-        epoch_start = time.perf_counter()
-
+        t0 = time.time()
         model.train()
-        train_acc = 0.0
-        n_batches = 0
+
+        running_loss = 0.0
+        num_batches = 0
 
         for step, (xb, yb) in enumerate(train_loader, start=1):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
 
+            # Cast inputs/targets, not the model
+            xb = _maybe_cast(xb, dtype)
+            yb = _maybe_cast(yb, dtype)
+
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=autocast_enabled):
-                prd = model(xb)
-                for _ in range(int(nfuture)):
-                    prd = model(prd)
-
-                if solver is not None:
-                    if loss_kind == "l2":
-                        loss = l2loss_sphere(solver, prd, yb, relative=False)
-                    elif loss_kind == "spectral_l2":
-                        loss = spectral_l2loss_sphere(solver, prd, yb, relative=False)
-                    else:
-                        raise ValueError(f"Unknown loss_kind '{loss_kind}'")
-                else:
-                    # Fallback plain MSE if we couldn't build SphereOps
-                    loss = torch.mean((prd - yb) ** 2)
+            with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=amp_enabled):
+                pred = model(xb)
+                loss = criterion(pred, yb)
 
             if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
+                scaler.scale(loss).step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 optimizer.step()
 
-            train_acc += float(loss.item())
-            n_batches += 1
+            running_loss += loss.detach().float().item()
+            num_batches += 1
 
             if LOG_EVERY_N_STEPS and (step % LOG_EVERY_N_STEPS == 0):
-                lr_dbg = _current_lr(optimizer)
-                logger.debug(
-                    f"[epoch {epoch:03d} step {step:05d}] lr={lr_dbg:.3e} train_loss={_format_sci4(loss.item())}"
-                )
+                logger.info(f"  step {step:6d} | train_loss={running_loss / num_batches: .4e}")
 
-        if scheduler is not None:
-            scheduler.step()
+        train_loss = running_loss / max(1, num_batches)
 
-        train_loss = train_acc / max(1, n_batches)
-
-        # Validation
-        val_loss = float("nan")
+        # ------------------- validation -------------------
         if val_loader is not None:
             model.eval()
-            v_acc = 0.0
-            v_n = 0
+            val_running = 0.0
+            val_batches = 0
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb = xb.to(device, non_blocking=True)
                     yb = yb.to(device, non_blocking=True)
-                    prd = model(xb)
-                    for _ in range(int(nfuture)):
-                        prd = model(prd)
+                    xb = _maybe_cast(xb, dtype)
+                    yb = _maybe_cast(yb, dtype)
+                    with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=amp_enabled):
+                        pred = model(xb)
+                        vloss = (val_criterion or criterion)(pred, yb)
+                    val_running += vloss.detach().float().item()
+                    val_batches += 1
+            val_loss = val_running / max(1, val_batches)
+        else:
+            val_loss = float("nan")
 
-                    if solver is not None:
-                        if loss_kind == "l2":
-                            vloss = l2loss_sphere(solver, prd, yb, relative=True)
-                        elif loss_kind == "spectral_l2":
-                            vloss = spectral_l2loss_sphere(solver, prd, yb, relative=True)
-                        else:
-                            raise ValueError(f"Unknown loss_kind '{loss_kind}'")
-                    else:
-                        vloss = torch.mean((prd - yb) ** 2)
+        # ------------------- scheduler -------------------
+        if scheduler is not None:
+            try:
+                scheduler.step()
+            except TypeError:
+                # Allow schedulers that expect a metric
+                try:
+                    scheduler.step(val_loss)
+                except Exception:
+                    pass
 
-                    v_acc += float(vloss.item())
-                    v_n += 1
-            val_loss = v_acc / max(1, v_n)
+        # ------------------- checkpoints -------------------
+        state = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_val": best_val,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "autocast_dtype": str(autocast_dtype),
+            "input_target_dtype": str(dtype),
+        }
+        torch.save(state, last_ckpt)
 
-        epoch_time = time.perf_counter() - epoch_start
-
-        # Log epoch line
-        lr = _current_lr(optimizer)
-        logger.info(
-            f"{epoch:5d} | {lr:10.3e} | {_format_sci4(train_loss):>15} | "
-            f"{_format_sci4(val_loss):>15} | {epoch_time:11.3f}"
-        )
-
-        # Append CSV
-        with csv_path.open("a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([epoch, f"{train_loss:.8e}", f"{val_loss:.8e}", f"{epoch_time:.3f}", f"{lr:.8e}", loss_kind, int(nfuture)])
-
-        # Checkpoints
-        # Save last
-        torch.save(
-            {
-                "epoch": epoch,
-                "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            },
-            last_ckpt,
-        )
-
-        # Save best
         if val_loader is not None and val_loss < best_val:
             best_val = val_loss
             best_epoch = epoch
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "state_dict": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                    "best_val": best_val,
-                },
-                best_ckpt,
-            )
+            state["best_val"] = best_val
+            torch.save(state, best_ckpt)
 
-    # If no validation loader: treat last as best for convenience
+        dt = time.time() - t0
+        lr = optimizer.param_groups[0].get("lr", float("nan"))
+        logger.info(f"{epoch:6d} | {lr: .3e} | {train_loss: .4e} | {val_loss: .4e} | {dt:7.1f}")
+
+    # If there was no validation, treat last as best
     if best_epoch < 0:
-        best_val = train_loss
-        torch.save(torch.load(last_ckpt), best_ckpt)
+        st = torch.load(last_ckpt, map_location="cpu")
+        best_val = st.get("train_loss", float("nan"))
+        torch.save(st, best_ckpt)
 
     return best_val, best_ckpt, last_ckpt

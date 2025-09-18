@@ -1,110 +1,118 @@
 #!/usr/bin/env python3
+"""
+Spherical operations for area-weighted integration on the sphere.
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Union
-
 import numpy as np
 import torch
-
-
-Tensor = torch.Tensor
 
 
 @dataclass
 class SphereOps:
     """
-    Minimal spherical utilities needed by training losses.
-
-    - integrate_grid(x, dimensionless=True):
-        Area-weighted reduction using cos(latitude) weights.
-        Shapes:
-          x: [H,W] -> scalar
-             [C,H,W] -> [C]
-             [B,C,H,W] -> [B,C]
-
-        If dimensionless=True, returns an area-weighted *mean* (weights normalized to 1).
-        If dimensionless=False, returns an area-weighted *sum* (i.e., unnormalized integral).
-        (Your training uses dimensionless=True, matching the reference code.)
-
-    - sht(x): placeholder; raise unless you wire torch-harmonics SHT.
+    Spherical integration utilities for training losses.
+    Provides area-weighted integration using cos(latitude) weights.
     """
-    lat: Union[np.ndarray, Tensor]
-    lon: Union[np.ndarray, Tensor]
+
+    lat: Union[np.ndarray, torch.Tensor]
+    lon: Union[np.ndarray, torch.Tensor]
 
     def __post_init__(self):
-        # Ensure 1D CPU numpy arrays
+        """Precompute integration weights."""
+        # Convert to numpy arrays
         self.lat = np.asarray(self.lat, dtype=np.float64).reshape(-1)
         self.lon = np.asarray(self.lon, dtype=np.float64).reshape(-1)
 
-        # Precompute 2D latitude weights (cos(lat)) in numpy; convert per-call to tensor dtype/device
-        lat_rad = np.deg2rad(self.lat)  # lat in degrees -> radians
-        w_lat = np.cos(lat_rad)         # shape [H]
-        w_lat = np.clip(w_lat, 0.0, None)  # avoid tiny negatives due to FP
-        self._w2d_np = w_lat[:, None] * np.ones((1, self.lon.shape[0]), dtype=np.float64)  # [H,W]
+        # Compute cos(latitude) weights
+        lat_rad = np.deg2rad(self.lat)
+        w_lat = np.cos(lat_rad)
+        w_lat = np.clip(w_lat, 0.0, None)  # Avoid negative weights
 
-        # Lazy device/dtype cache
-        self._w_cache: dict[tuple[torch.device, torch.dtype], Tensor] = {}
+        # Create 2D weight array [H, W]
+        self._w2d_np = w_lat[:, None] * np.ones((1, self.lon.shape[0]), dtype=np.float64)
 
-    # --------------------------- helpers ---------------------------
+        # Cache for device/dtype combinations
+        self._w_cache = {}
 
     @property
     def nlat(self) -> int:
-        return int(self.lat.shape[0])
+        """Number of latitude points."""
+        return len(self.lat)
 
     @property
     def nlon(self) -> int:
-        return int(self.lon.shape[0])
+        """Number of longitude points."""
+        return len(self.lon)
 
-    def _weights(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+    def _get_weights(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Get cached weights for specific device and dtype."""
         key = (device, dtype)
-        wt = self._w_cache.get(key)
-        if wt is None:
-            wt = torch.from_numpy(self._w2d_np).to(device=device, dtype=dtype)  # [H,W]
-            self._w_cache[key] = wt
-        return wt
+        if key not in self._w_cache:
+            self._w_cache[key] = torch.from_numpy(self._w2d_np).to(device=device, dtype=dtype)
+        return self._w_cache[key]
 
-    # --------------------------- public API ---------------------------
-
-    def integrate_grid(self, x: Tensor, dimensionless: bool = True) -> Tensor:
+    def integrate_grid(self, x: torch.Tensor, dimensionless: bool = True) -> torch.Tensor:
         """
-        Area-weighted reduction across spatial dims with cos(lat) weights.
+        Compute area-weighted integral over the sphere.
 
-        x: [H,W], [C,H,W], or [B,C,H,W]
-        Returns: scalar, [C], or [B,C], respectively.
+        Args:
+            x: Tensor of shape [H,W], [C,H,W], or [B,C,H,W]
+            dimensionless: If True, normalize weights to sum to 1 (weighted mean)
+                          If False, use unnormalized weights (weighted sum)
 
-        dimensionless=True  -> area-weighted *mean* (weights normalized to 1)
-        dimensionless=False -> area-weighted *sum*  (unnormalized integral)
+        Returns:
+            Integrated result with spatial dimensions reduced:
+            - [H,W] -> scalar
+            - [C,H,W] -> [C]
+            - [B,C,H,W] -> [B,C]
         """
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x)
+
         if x.dim() not in (2, 3, 4):
-            raise ValueError(f"integrate_grid expects 2D/3D/4D tensor, got shape {tuple(x.shape)}")
+            raise ValueError(f"Expected 2D/3D/4D tensor, got {x.dim()}D")
 
-        H = x.shape[-2]
-        W = x.shape[-1]
+        # Check spatial dimensions
+        H, W = x.shape[-2], x.shape[-1]
         if H != self.nlat or W != self.nlon:
-            raise ValueError(f"Spatial shape mismatch: got HxW={H}x{W}, expected {self.nlat}x{self.nlon}")
+            raise ValueError(f"Shape mismatch: expected ({self.nlat},{self.nlon}), got ({H},{W})")
 
-        wt = self._weights(x.device, x.dtype)  # [H,W]
+        # Get weights in fp32 for stable reduction
+        weights = self._get_weights(x.device, torch.float32)
 
+        # Normalize weights if requested
         if dimensionless:
-            wt = wt / torch.clamp(wt.sum(), min=torch.finfo(wt.dtype).eps)  # normalize to sum=1
+            weights = weights / weights.sum()
 
+        # Cast input to fp32 for stable computation
+        x_fp32 = x.to(dtype=torch.float32)
+
+        # Compute weighted integral
         if x.dim() == 2:
             # [H,W] -> scalar
-            return (x * wt).sum()
-
-        if x.dim() == 3:
+            result = (x_fp32 * weights).sum()
+        elif x.dim() == 3:
             # [C,H,W] -> [C]
-            return (x * wt).sum(dim=(-2, -1))
+            result = (x_fp32 * weights).sum(dim=(-2, -1))
+        else:
+            # [B,C,H,W] -> [B,C]
+            result = (x_fp32 * weights).sum(dim=(-2, -1))
 
-        # [B,C,H,W] -> [B,C]
-        return (x * wt).sum(dim=(-2, -1))
+        # Return in original dtype if it was lower precision
+        if x.dtype in [torch.float16, torch.bfloat16]:
+            result = result.to(dtype=x.dtype)
 
-    def sht(self, x: Tensor) -> Tensor:
+        return result
+
+    def sht(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Placeholder: spherical harmonic transform of x.
-        Wire this to torch-harmonics if you want spectral loss:
-          - Accept shapes [B,C,H,W] or [C,H,W], return complex coeffs.
+        Spherical harmonic transform (placeholder).
+        Implement this if you need spectral losses by connecting to torch-harmonics.
         """
-        raise NotImplementedError("SphereOps.sht is not implemented. Use l2 loss or wire torch-harmonics SHT.")
+        raise NotImplementedError(
+            "Spherical harmonic transform not implemented. "
+            "Use l2 loss or wire torch-harmonics SHT for spectral losses."
+        )
