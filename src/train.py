@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sphere_ops import SphereOps
-from config import LOG_EVERY_N_STEPS, EPOCHS  # EPOCHS kept for parity
+from config import LOG_EVERY_N_STEPS, EPOCHS, CLIP_GRAD_NORM, CLIP_GRAD_VALUE
 
 
 # ------------------- dtype helpers -------------------
@@ -148,7 +148,6 @@ def make_spectral_mse(
     return criterion
 
 
-# ------------------- training loop -------------------
 def train_loop(
     *,
     model: torch.nn.Module,
@@ -166,31 +165,26 @@ def train_loop(
     dtype: Union[str, torch.dtype] = torch.float32,
 ) -> Tuple[float, Path, Path]:
     """
-    Full training loop with dtype coercion and AMP handling.
-
-    Returns:
-        best_val: float
-        best_ckpt: Path
-        last_ckpt: Path
+    Full training loop with:
+      - autocast AMP
+      - NaN/Inf loss guard
+      - configurable gradient clipping (norm/value) via config.py
+      - optional distinct validation criterion (e.g., relative L2)
     """
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
+    # ---- setup ----
     dtype = _coerce_dtype(dtype)
-
-    # IMPORTANT: do NOT cast model dtype; SFNO may contain complex params/buffers.
     model = model.to(device=device)
-
     device_type = "cuda" if getattr(device, "type", None) == "cuda" else "cpu"
 
-    # AMP config: autocast to requested dtype; GradScaler only for CUDA FP16
     if use_amp and dtype in (torch.float16, torch.bfloat16):
         autocast_dtype = dtype
-        scaler = torch.cuda.amp.GradScaler(enabled=(device_type == "cuda" and dtype is torch.float16))
+        from torch import amp  # local import to avoid global side effects
+        scaler = amp.GradScaler("cuda", enabled=(device_type == "cuda" and dtype is torch.float16))
         amp_enabled = True
     else:
         autocast_dtype = torch.float32
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        from torch import amp
+        scaler = amp.GradScaler("cuda", enabled=False)
         amp_enabled = False
 
     logger.info(
@@ -205,23 +199,16 @@ def train_loop(
     best_val = float("inf")
     best_epoch = -1
 
-    # ------------------------------------------------------------------
-    # Epoch loop
-    # ------------------------------------------------------------------
+    # ---- epochs ----
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         model.train()
-
         running_loss = 0.0
         num_batches = 0
 
         for step, (xb, yb) in enumerate(train_loader, start=1):
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-
-            # Cast inputs/targets, not the model
-            xb = _maybe_cast(xb, dtype)
-            yb = _maybe_cast(yb, dtype)
+            xb = _maybe_cast(xb.to(device, non_blocking=True), dtype)
+            yb = _maybe_cast(yb.to(device, non_blocking=True), dtype)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -229,32 +216,57 @@ def train_loop(
                 pred = model(xb)
                 loss = criterion(pred, yb)
 
+            # Guard against pathological batches
+            if not torch.isfinite(loss):
+                logger.warning("Non-finite loss; skipping this batch.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             if scaler.is_enabled():
-                scaler.scale(loss).step(optimizer)
+                # AMP path
+                scaler.scale(loss).backward()
+                # Unscale so clipping sees real grads
+                scaler.unscale_(optimizer)
+
+                # --- CONFIG-DRIVEN CLIPPING ---
+                if CLIP_GRAD_NORM is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CLIP_GRAD_NORM)
+                if CLIP_GRAD_VALUE is not None:
+                    torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=CLIP_GRAD_VALUE)
+                # --------------------------------
+
+                scaler.step(optimizer)
                 scaler.update()
             else:
+                # FP32 path
                 loss.backward()
+
+                # --- CONFIG-DRIVEN CLIPPING ---
+                if CLIP_GRAD_NORM is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=CLIP_GRAD_NORM)
+                if CLIP_GRAD_VALUE is not None:
+                    torch.nn.utils.clip_grad_value_(model.parameters(), clip_value=CLIP_GRAD_VALUE)
+                # --------------------------------
+
                 optimizer.step()
 
             running_loss += loss.detach().float().item()
             num_batches += 1
 
             if LOG_EVERY_N_STEPS and (step % LOG_EVERY_N_STEPS == 0):
-                logger.info(f"  step {step:6d} | train_loss={running_loss / num_batches: .4e}")
+                logger.info(f"  step {step:6d} | train_loss={running_loss/num_batches: .4e}")
 
         train_loss = running_loss / max(1, num_batches)
 
-        # ------------------- validation -------------------
+        # ---- validation ----
         if val_loader is not None:
             model.eval()
             val_running = 0.0
             val_batches = 0
             with torch.no_grad():
                 for xb, yb in val_loader:
-                    xb = xb.to(device, non_blocking=True)
-                    yb = yb.to(device, non_blocking=True)
-                    xb = _maybe_cast(xb, dtype)
-                    yb = _maybe_cast(yb, dtype)
+                    xb = _maybe_cast(xb.to(device, non_blocking=True), dtype)
+                    yb = _maybe_cast(yb.to(device, non_blocking=True), dtype)
                     with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=amp_enabled):
                         pred = model(xb)
                         vloss = (val_criterion or criterion)(pred, yb)
@@ -264,18 +276,17 @@ def train_loop(
         else:
             val_loss = float("nan")
 
-        # ------------------- scheduler -------------------
+        # ---- scheduler ----
         if scheduler is not None:
             try:
                 scheduler.step()
             except TypeError:
-                # Allow schedulers that expect a metric
                 try:
                     scheduler.step(val_loss)
                 except Exception:
                     pass
 
-        # ------------------- checkpoints -------------------
+        # ---- checkpoints ----
         state = {
             "epoch": epoch,
             "model": model.state_dict(),
@@ -298,7 +309,6 @@ def train_loop(
         lr = optimizer.param_groups[0].get("lr", float("nan"))
         logger.info(f"{epoch:6d} | {lr: .3e} | {train_loss: .4e} | {val_loss: .4e} | {dt:7.1f}")
 
-    # If there was no validation, treat last as best
     if best_epoch < 0:
         st = torch.load(last_ckpt, map_location="cpu")
         best_val = st.get("train_loss", float("nan"))

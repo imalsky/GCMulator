@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -17,8 +17,8 @@ from config import (
     PROJECT_ROOT, RAW_DATA_DIR, PROCESSED_DATA_DIR, SNAPSHOT_GLOB,
     FILE_INDEX_START, FILE_INDEX_END, FILE_INDEX_STEP,
     VARIABLES, DROPPED_VARIABLES, LEVELS_SLICE,
-    BATCH_SIZE, EPOCHS, WEIGHT_DECAY, USE_AMP,
-    LR_SCHEDULER, LR_MAX, LR_MIN,
+    BATCH_SIZE, EPOCHS, WEIGHT_DECAY, USE_AMP,   # WEIGHT_DECAY unused if using builder (ok)
+    LR_SCHEDULER, LR_MAX, LR_MIN,                # LR_* unused if using builder (ok)
     GRID, GRID_INTERNAL, SCALE_FACTOR,
     EMBED_DIM, NUM_LAYERS, ENCODER_LAYERS,
     ACTIVATION_FUNCTION, USE_MLP, MLP_RATIO,
@@ -33,6 +33,48 @@ from normalization import Normalizer
 from planet_model import PlanetSnapshotForecastDataset
 from sfno_model import build_sfno
 from train import train_loop, make_spherical_mse
+
+
+def enable_fast_math():
+    """Enable TF32 paths on A100 for speed/stability."""
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+def build_optimizer_and_scheduler(model) -> tuple[torch.optim.Optimizer, Optional[object]]:
+    """
+    Optimizer/scheduler that respects config.py:
+      - lr = LR_MAX
+      - weight_decay = WEIGHT_DECAY
+      - LR_SCHEDULER: "cosine" or None
+      - Optional warmup (set WARMUP_EPOCHS > 0 below if you want it)
+    """
+    # import here to avoid circulars
+    from config import LR_MAX, WEIGHT_DECAY, LR_MIN, LR_SCHEDULER, EPOCHS
+
+    # If you want warmup controlled by config, add it there and import.
+    WARMUP_EPOCHS = 0  # set to e.g. 5 if you want linear warmup
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR_MAX, weight_decay=WEIGHT_DECAY)
+
+    scheduler: Optional[object] = None
+    if LR_SCHEDULER == "cosine":
+        if WARMUP_EPOCHS > 0:
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, EPOCHS - WARMUP_EPOCHS), eta_min=LR_MIN
+            )
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, end_factor=1.0, total_iters=WARMUP_EPOCHS
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup, cosine], milestones=[WARMUP_EPOCHS]
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=EPOCHS, eta_min=LR_MIN
+            )
+    return optimizer, scheduler
+
 
 
 # ---------------- precision selection ----------------
@@ -130,6 +172,7 @@ def main():
     # Repro
     torch.manual_seed(SEED_GLOBAL)
     torch.cuda.manual_seed_all(SEED_GLOBAL)
+    enable_fast_math()
     torch.backends.cudnn.benchmark = True
 
     # Device
@@ -203,15 +246,10 @@ def main():
         dtype=precision_label,  # accepted for logging; not applied to model dtype
     )
 
-    # Optimizer & scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR_MAX, weight_decay=WEIGHT_DECAY)
-    scheduler = None
-    if LR_SCHEDULER == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=EPOCHS, eta_min=LR_MIN
-        )
+    # Optimizer & scheduler (stable defaults)
+    optimizer, scheduler = build_optimizer_and_scheduler(model)
 
-    # Losses — restore reference behavior:
+    # Losses — reference behavior:
     #   train: absolute L2 (area-weighted)
     #   val  : relative L2 (area-weighted ÷ ∫target^2)
     criterion_train = make_spherical_mse(nlat=H, nlon=W, relative=False)

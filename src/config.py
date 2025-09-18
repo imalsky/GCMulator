@@ -29,7 +29,7 @@ SNAPSHOT_GLOB = "hs94.*_latlon.nc"
 # File subset (by index)
 # =========================
 FILE_INDEX_START: Optional[int] = 0
-FILE_INDEX_END:   Optional[int] = 500     # None -> all
+FILE_INDEX_END:   Optional[int] = 1200     # None -> all
 FILE_INDEX_STEP:  int = 1                # positive, non-zero
 
 # =========================
@@ -78,8 +78,8 @@ GRID_INTERNAL: str = "legendre-gauss"
 SCALE_FACTOR: int = 1
 
 # Channels are inferred from data; embed/stack depth
-EMBED_DIM: int = 16
-NUM_LAYERS: int = 4
+EMBED_DIM: int = 96
+NUM_LAYERS: int = 8
 ENCODER_LAYERS: int = 3
 
 # MLP head inside each block
@@ -106,13 +106,18 @@ RESIDUAL_PREDICTION: Optional[bool] = None
 # Training
 # =========================
 BATCH_SIZE: int = 64
-EPOCHS: int = 200
+EPOCHS: int = 500
 WEIGHT_DECAY: float = 1e-5
+
+
+CLIP_GRAD_NORM: Optional[float] = 1.0     # set to None to disable
+CLIP_GRAD_VALUE: Optional[float] = None   # or e.g., 0.5; None to disable
 
 # LR scheduler (cosine annealing)
 LR_SCHEDULER: Optional[str] = "cosine"  # "cosine" or None
-LR_MAX: float = 5e-3
+LR_MAX: float = 1e-3
 LR_MIN: float = 1e-7
+WARMUP_EPOCHS = 5
 
 USE_AMP: bool = False   # autocast
 
